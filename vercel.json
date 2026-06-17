@@ -1,5 +1,8 @@
 {
   "crons": [
-    { "path": "/api/refresh-following", "schedule": "0 3 * * *" }
-  ]
+    { "path": "/api/refresh-following", "schedule": "0 */6 * * *" }
+  ],
+  "functions": {
+    "api/refresh-following.js": { "maxDuration": 60 }
+  }
 }
