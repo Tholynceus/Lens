@@ -68,7 +68,7 @@ export default async function handler(req, res) {
 
   try {
     const only = String(req.query.only || '').toLowerCase().replace(/^@/, '').trim();
-    const limit = Math.max(1, Math.min(20, parseInt(req.query.limit, 10) || 5));
+    const limit = Math.max(1, Math.min(60, parseInt(req.query.limit, 10) || 25));
 
     const { data: accts, error } = await supabase.from('smart_accounts').select('handle').eq('active', true);
     if (error) throw error;
@@ -84,12 +84,16 @@ export default async function handler(req, res) {
       batch = (accts || []).sort((a, b) => (seen[a.handle] || 0) - (seen[b.handle] || 0)).slice(0, limit);
     }
 
+    // Time budget: stop starting new accounts after 40s so we return cleanly
+    // before Vercel's 60s function timeout (one big account can take ~18s).
+    const started = Date.now();
     const results = [];
     for (const a of batch) {
+      if (!only && Date.now() - started > 40000) break;
       try { results.push(await refreshOne(a)); }
       catch (e) { await mark(a.handle, 'error', 0); results.push({ handle: a.handle, status: 'error', error: String((e && e.message) || e) }); }
     }
-    return res.status(200).json({ processed: results.length, results });
+    return res.status(200).json({ processed: results.length, remaining: batch.length - results.length, results });
   } catch (e) {
     return res.status(500).json({ error: String((e && e.message) || e) });
   }
