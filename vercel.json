@@ -1,5 +1,0 @@
-{
-  "crons": [
-    { "path": "/api/cron/refresh-following", "schedule": "0 3 * * *" }
-  ]
-}
