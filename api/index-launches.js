@@ -20,7 +20,12 @@ async function fetchWithTimeout(url, options = {}, ms = 12000) {
 
 export default async function handler(req, res) {
   // Hard guard: if CRON_SECRET isn't configured, refuse — never accept "Bearer undefined".
-  if (!CRON_SECRET || req.headers.authorization !== `Bearer ${CRON_SECRET}`) {
+  // Accept either the cron Bearer header OR a ?secret= query param (so it can be
+  // triggered manually from a browser to force-index a brand-new launch).
+  const authed =
+    req.headers.authorization === `Bearer ${CRON_SECRET}` ||
+    req.query?.secret === CRON_SECRET;
+  if (!CRON_SECRET || !authed) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
@@ -63,6 +68,7 @@ async function indexLaunches() {
   const launches = Array.isArray(listData) ? listData : (listData.launches || []);
   let indexed = 0;
   let failed = 0;
+  let sampleError = null;
   const now = new Date().toISOString();
   for (const launch of launches) {
     // Per-launch isolation: one bad row must NOT abort the whole batch.
@@ -104,10 +110,11 @@ async function indexLaunches() {
       indexed++;
     } catch (e) {
       failed++;
+      if (!sampleError) sampleError = String(e && e.message || e);
       // continue with the next launch
     }
   }
-  return { indexed, failed, total: launches.length };
+  return { indexed, failed, total: launches.length, sampleError };
 }
 
 async function checkAndSaveClaims(wallet, tokenAddress, tokenSymbol) {
