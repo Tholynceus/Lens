@@ -98,7 +98,7 @@ async function indexLaunches() {
         is_new: isNew,
         updated_at: now,
       };
-      await supabaseUpsert('bankr_launches', row);
+      await supabaseUpsert('bankr_launches', row, 'token_address');
       if (deployerWallet) {
         await checkAndSaveClaims(deployerWallet, tokenAddress, launch.tokenSymbol);
       }
@@ -173,8 +173,9 @@ async function saveFeeStructure(tokenAddress, wallet) {
   } catch (e) {}
 }
 
-async function supabaseUpsert(table, row) {
-  const r = await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/${table}`, {
+async function supabaseUpsert(table, row, onConflict) {
+  const q = onConflict ? `?on_conflict=${onConflict}` : '';
+  const r = await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/${table}${q}`, {
     method: 'POST',
     headers: {
       'apikey': SUPABASE_SERVICE_KEY,
