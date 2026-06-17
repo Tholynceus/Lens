@@ -1,8 +1,0 @@
-{
-  "crons": [
-    {
-      "path": "/api/index-launches",
-      "schedule": "*/5 * * * *"
-    }
-  ]
-}
