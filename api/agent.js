@@ -12,7 +12,7 @@
 // Data sources: Dexscreener (public), twitterapi.io (handle), our own
 // /api/smart-followers (deployed). No private data, public only.
 
-export const config = { maxDuration: 30 };
+export const config = { maxDuration: 60 };
 
 const LLM_KEY = process.env.LLM_API_KEY;
 const LLM_URL = (process.env.LLM_API_URL || 'https://api.venice.ai/api/v1').replace(/\/+$/, '');
@@ -23,13 +23,48 @@ const SELF = 'https://lens-liard.vercel.app';
 // Only let our own surfaces call this (soft guard against random embeds / cost abuse).
 const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io', 'https://x.com', 'https://twitter.com', 'http://localhost'];
 
-const SYSTEM = [
-  'You are LENS, an on-chain intelligence agent for Base and crypto Twitter.',
-  'You explain a token or an X account to a trader in plain English.',
-  'Use ONLY the data in the CONTEXT block. Never invent numbers, names, or facts. If something is unknown, say it is unknown.',
-  'Format for fast scanning: start with one bold summary line, then 3 to 6 short bullet points, then a final line "Risk read: LOW | MEDIUM | HIGH" with a six-word reason when there is enough signal.',
-  'Be concise, under about 180 words. This is information, not financial advice.',
+const PERSONA = [
+  'You are LENS, the on-chain intelligence assistant for crypto Twitter and the Base chain.',
+  'You live inside a browser extension that reads any X profile and surfaces on-chain signals.',
+  'You can do three things: (1) analyze a contract address, (2) analyze an X account or deployer, and (3) chat and answer questions about LENS itself and about on-chain / crypto concepts.',
+  'Voice: friendly, sharp, plain English, lightly casual. Keep replies tight and scannable.',
+  'Rules: use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
+  'When you have token or account DATA, give a one-line bold summary, then 3 to 6 short bullets, then a final "Risk read: LOW | MEDIUM | HIGH" line with a short reason.',
+  'When the user asks about LENS features or how something works, answer from the LENS DOCS / KNOWLEDGE provided, briefly.',
+  'This is information, not financial advice. Never tell people to buy or sell.',
 ].join(' ');
+
+const LENS_KNOWLEDGE = [
+  'LENS is a Chrome extension at lnsx.io that injects on-chain intelligence under any X/Twitter profile, focused on Base and Bankrbot tokens.',
+  'Live features: AI Verdict (one-line LLM risk read), Trust Score, Bankrbot Tokens, Dev Claim Fee tracking, Dev Sold detection, PleaseBro (earning fees from tokens deployed by others), CA Hunter (finds contract addresses in a bio), Contracts Deployed and serial-dev detection, CA History, Bundled Wallets clustering, Linked Accounts (other X profiles sharing a wallet), Funding Trail (funder tracing), Origin Check (location / VPN signal), Token Health (dev live percent of supply), Community Tags, Holders-on-X, and Smart Followers (notable on-chain accounts that follow a profile).',
+  'Coming soon: GitHub Intel and Username History.',
+  'Smart Followers works by keeping a curated set of high-signal accounts, indexing who each of them follows, then surfacing which of them follow the profile you open. It runs on the LENS backend and needs no other extension.',
+  'X handle is @lnsx_io. Docs live at lnsx.io/lens-docs.',
+].join(' ');
+
+// Live docs, fetched from the site and cached in the warm instance (1h TTL).
+let _docsCache = { text: '', ts: 0 };
+async function getDocs() {
+  if (_docsCache.text && Date.now() - _docsCache.ts < 3600000) return _docsCache.text;
+  try {
+    const ctrl = new AbortController();
+    const tm = setTimeout(() => ctrl.abort(), 6000);
+    const r = await fetch('https://lnsx.io/lens-docs.html', { signal: ctrl.signal });
+    clearTimeout(tm);
+    if (r.ok) {
+      const html = await r.text();
+      const txt = html
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&[a-z]+;/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      _docsCache = { text: txt.slice(0, 7000), ts: Date.now() };
+    }
+  } catch (e) { /* fall back to baked knowledge */ }
+  return _docsCache.text;
+}
 
 function fmtNum(n) {
   n = Number(n);
@@ -187,9 +222,9 @@ function buildContext(det, data) {
 }
 
 export default async function handler(req, res) {
-  const origin = req.headers.origin || '';
-  const allowed = !origin || ALLOW.some(a => origin.startsWith(a));
-  res.setHeader('Access-Control-Allow-Origin', allowed ? (origin || '*') : 'https://lnsx.io');
+  // Public read-only endpoint: allow any origin so it works on lnsx.io, Vercel
+  // preview URLs, and the extension. (Rate-limiting can be added later if needed.)
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
@@ -197,43 +232,53 @@ export default async function handler(req, res) {
   if (!LLM_KEY) return res.status(200).json({ ok: false, error: 'LLM_API_KEY not configured' });
 
   try {
-    let q = '';
+    let q = '', history = [];
     if (req.method === 'POST') {
       let body = req.body;
       if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = {}; } }
-      q = (body && (body.q || body.query || body.message)) || '';
+      body = body || {};
+      q = body.q || body.query || body.message || '';
+      if (Array.isArray(body.history)) history = body.history;
     } else {
       q = req.query.q || req.query.query || '';
     }
-    q = String(q).slice(0, 400).trim();
+    q = String(q).slice(0, 500).trim();
     if (!q) return res.status(200).json({ ok: false, error: 'empty query' });
 
     const det = detect(q);
 
+    // gather on-chain data when a CA or handle is present in the message
     let data = {};
     if (det.type === 'ca') data = await gatherCA(det.value);
     else if (det.type === 'handle') data = await gatherHandle(det.value);
 
-    // freeform with nothing detected: short guided reply, no LLM spend
-    if (det.type === 'freeform') {
-      return res.status(200).json({
-        ok: true, type: 'freeform', data: {},
-        answer: 'Paste a **contract address** (0x...) or an **X handle** (@username) and I will pull the on-chain intel and break it down for you.',
-      });
+    // load docs (cached) so LENS can answer product questions accurately
+    const docs = await getDocs();
+
+    const systemContent = PERSONA +
+      '\n\nLENS KNOWLEDGE:\n' + LENS_KNOWLEDGE +
+      (docs ? '\n\nLENS DOCS (reference, may be truncated):\n' + docs : '');
+
+    // sanitize prior turns: last 8, role + string content only
+    const hist = history
+      .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .slice(-8)
+      .map(m => ({ role: m.role, content: String(m.content).slice(0, 1500) }));
+
+    // current turn, with on-chain DATA appended when we looked something up
+    let userContent = q;
+    if (det.type === 'ca' || det.type === 'handle') {
+      userContent = q + '\n\n[LENS DATA for this lookup, use ONLY this for facts]\n' + buildContext(det, data);
     }
 
-    const context = buildContext(det, data);
-    const userMsg = `User question: ${det.q}\n\nCONTEXT (only use this):\n${context}`;
+    const messages = [{ role: 'system', content: systemContent }, ...hist, { role: 'user', content: userContent }];
 
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 25000);
     const r = await fetch(`${LLM_URL}/chat/completions`, {
       method: 'POST', signal: ctrl.signal,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${LLM_KEY}` },
-      body: JSON.stringify({
-        model: LLM_MODEL, temperature: 0.35, max_tokens: 600,
-        messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: userMsg }],
-      }),
+      body: JSON.stringify({ model: LLM_MODEL, temperature: 0.4, max_tokens: 700, messages }),
     });
     clearTimeout(t);
 
