@@ -34,6 +34,7 @@ const PERSONA = [
   'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
   'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets, then a final "Risk read: LOW | MEDIUM | HIGH" line. For normal conversation, just reply naturally in a sentence or two, no forced format.',
   'Keep replies tight and plain English. This is information, not financial advice, and never tell people to buy or sell.',
+  'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
 ].join(' ');
 
 const LENS_KNOWLEDGE = [
@@ -153,6 +154,19 @@ function bankrLines(b) {
   if (b.unclaimed_usd && parseFloat(b.unclaimed_usd) > 0) L.push('Unclaimed fees: $' + b.unclaimed_usd);
   if (b.is_pleasebro) L.push('Fee recipient differs from deployer (PleaseBro pattern)');
   return L.join('. ');
+}
+
+// remove em dash / en dash / double hyphen from the model output, keep single hyphens
+function stripDashes(s) {
+  if (!s) return s;
+  return String(s)
+    .replace(/\s*[—–]\s*/g, ', ')   // em / en dash -> comma
+    .replace(/ ?-{2,} ?/g, ', ')    // double+ hyphen -> comma
+    .replace(/ ,/g, ',')
+    .replace(/,\s*,/g, ',')
+    .replace(/,\s*([.!?])/g, '$1')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
 }
 
 // ── CA → token data via Dexscreener + Alchemy metadata ──
@@ -378,7 +392,8 @@ export default async function handler(req, res) {
     if (Array.isArray(answer)) answer = answer.map(p => (typeof p === 'string' ? p : (p && p.text) || '')).join(' ');
     if (!answer && msg.reasoning_content) answer = String(msg.reasoning_content);
 
-    return res.status(200).json({ ok: true, type: det.type, data, answer: answer.trim(), model: LLM_MODEL });
+    answer = stripDashes(answer.trim());
+    return res.status(200).json({ ok: true, type: det.type, data, answer, model: LLM_MODEL });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String((e && e.message) || e) });
   }
