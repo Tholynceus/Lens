@@ -78,6 +78,18 @@ function fmtNum(n) {
   return String(n);
 }
 
+function timeAgo(ts) {
+  const t = new Date(ts).getTime();
+  if (!t || isNaN(t)) return '';
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+  const d = Math.floor(h / 24); if (d < 30) return d + 'd ago';
+  const mo = Math.floor(d / 30); if (mo < 12) return mo + 'mo ago';
+  return Math.floor(mo / 12) + 'y ago';
+}
+
 const CA_RE = /0x[a-fA-F0-9]{40}/;
 function detect(q) {
   const text = String(q || '').trim();
@@ -142,6 +154,26 @@ async function bankrByCA(ca) {
     claimed_eth: claimedEth != null ? claimedEth.toFixed(4) : null,
     is_pleasebro: !!(dw && fw && dw !== fw),
   };
+}
+
+// Handle -> recent Bankrbot launches by this deployer. /api/lookup can lag for
+// tokens launched seconds ago; this reads the SAME bankr_launches table the Live
+// Feed uses, so the agent stays consistent with what the Live Feed shows.
+async function bankrByHandle(handle) {
+  const h = String(handle || '').toLowerCase().replace(/^@/, '').trim();
+  if (!h) return [];
+  const rows = await sb(`bankr_launches?x_username=ilike.${encodeURIComponent(h)}&select=*&limit=20`);
+  if (!rows || !rows.length) return [];
+  const list = rows
+    .filter(t => String(t.x_username || '').toLowerCase() === h) // ilike treats _ as a wildcard; require exact handle
+    .map(t => ({
+    ca: String(t.token_address || '').toLowerCase(),
+    symbol: t.token_symbol || t.symbol || null,
+    name: t.token_name || t.name || null,
+    launched_at: t.launched_at || t.created_at || null,
+  })).filter(t => /^0x[0-9a-f]{40}$/.test(t.ca));
+  list.sort((a, b) => new Date(b.launched_at || 0) - new Date(a.launched_at || 0));
+  return list;
 }
 
 function bankrLines(b) {
@@ -251,11 +283,13 @@ async function gatherTicker(sym) {
 // ── handle → on-chain intel (lookup) + smart followers + bio ──
 async function gatherHandle(handle) {
   const out = { handle, found: false };
-  const [lk, sf] = await Promise.all([
+  const [lk, sf, launches] = await Promise.all([
     getJSON(`${SELF}/api/lookup?username=${encodeURIComponent(handle)}`),
     getJSON(`${SELF}/api/smart-followers?handle=${encodeURIComponent(handle)}`),
+    bankrByHandle(handle),
   ]);
   if (lk && lk.success && lk.data && lk.data.found) { out.found = true; out.intel = lk.data; }
+  if (Array.isArray(launches) && launches.length) { out.launches = launches; out.found = true; }
   if (sf && Array.isArray(sf.followers)) {
     out.smartFollowers = sf.followers.map(f => '@' + (f.handle || f)).slice(0, 20);
     out.smartFollowerCount = sf.count || out.smartFollowers.length;
@@ -320,6 +354,14 @@ function buildContext(det, data) {
     if (data.followers) lines.push(`Followers: ${data.followers}`);
     if (data.bio) lines.push(`Bio: ${data.bio}`);
     if (data.bioCA) lines.push(`Contract address in bio: ${data.bioCA}`);
+    if (data.launches && data.launches.length) {
+      const recent = data.launches.slice(0, 5).map(t => {
+        const sym = t.symbol ? `$${t.symbol}` : (t.name || 'token');
+        const when = t.launched_at ? ` (${timeAgo(t.launched_at)})` : '';
+        return `${sym} ${t.ca}${when}`;
+      });
+      lines.push(`Tokens launched by this account, from the live Bankrbot launch feed: ${recent.join('; ')}`);
+    }
     const i = data.intel;
     if (i) {
       lines.push(`Bankrbot tokens deployed: ${i.token_count || 0}`);
@@ -340,7 +382,7 @@ function buildContext(det, data) {
       if (i.unclaimed_usd_total && parseFloat(i.unclaimed_usd_total) > 0) lines.push(`Unclaimed fees: $${i.unclaimed_usd_total}`);
       if (i.holders_on_x_count) lines.push(`Known X accounts holding this dev's tokens: ${i.holders_on_x_count}`);
       if (i.holder_stats && typeof i.holder_stats === 'object') lines.push(`Holder stats: ${JSON.stringify(i.holder_stats).slice(0, 220)}`);
-    } else {
+    } else if (!(data.launches && data.launches.length)) {
       lines.push("No Bankrbot/Base deploy footprint found for this account (not a tracked deployer).");
     }
     if (data.smartFollowerCount != null) lines.push(`Smart followers (notable on-chain accounts that follow them): ${data.smartFollowerCount}`);
