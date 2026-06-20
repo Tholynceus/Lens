@@ -31,14 +31,14 @@ export default async function handler(req, res) {
     const question = (body && body.question ? String(body.question) : "").slice(0, 800).trim();
     if (!question) return res.status(400).json({ error: "missing question" });
 
-    const key = process.env.VENICE_INFERENCE_KEY;
+    const key = process.env.LLM_API_KEY;
     if (!key) return res.status(500).json({ error: "server not configured" });
 
     const upstream = await fetch("https://api.venice.ai/api/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + key },
       body: JSON.stringify({
-        model: "minimax-m3",
+        model: process.env.LLM_MODEL || "minimax-m3",
         stream: true,
         temperature: 0.3,
         max_tokens: 600,
