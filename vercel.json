@@ -1,8 +1,12 @@
 {
   "crons": [
+    { "path": "/api/index-launches", "schedule": "*/10 * * * *" },
+    { "path": "/api/cron-holders", "schedule": "0 */6 * * *" },
     { "path": "/api/refresh-following", "schedule": "0 */6 * * *" }
   ],
   "functions": {
+    "api/index-launches.js": { "maxDuration": 60 },
+    "api/cron-holders.js": { "maxDuration": 300 },
     "api/refresh-following.js": { "maxDuration": 300 }
   }
 }
