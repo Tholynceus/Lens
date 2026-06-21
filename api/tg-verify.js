@@ -1,27 +1,20 @@
-// LENS - verify a Telegram sign-in code
+// LENS - verify a Telegram sign-in code  (ESM)
 // Deploy as: Lens repo -> api/tg-verify.js  (URL: https://lens-liard.vercel.app/api/tg-verify)
 // Called by markets.html:  GET /api/tg-verify?code=XXXX
-//
-// Uses the same Supabase env as tg-bot.js:
-//   SUPABASE_SERVICE_KEY (or SUPABASE_SERVICE_ROLE_KEY), SUPABASE_URL (optional)
 
-const crypto = require('crypto');
+import { randomBytes } from 'crypto';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://irtfaxhvphjtqczswrck.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
   || process.env.SUPABASE_SERVICE_ROLE_KEY
   || process.env.SUPABASE_KEY;
 
-const newToken = () => crypto.randomBytes(24).toString('hex');
+const newToken = () => randomBytes(24).toString('hex');
 
-function cors(res) {
+export default async function handler(req, res) {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'GET,OPTIONS');
   res.setHeader('access-control-allow-headers', 'content-type');
-}
-
-module.exports = async (req, res) => {
-  cors(res);
   if (req.method === 'OPTIONS') { res.status(204).end(); return; }
 
   const code = (req.query && (req.query.code || req.query.c)) || '';
@@ -61,4 +54,4 @@ module.exports = async (req, res) => {
       first_name: row.tg_first_name,
     },
   });
-};
+}

@@ -1,15 +1,15 @@
-// LENS - Telegram sign-in bot webhook
+// LENS - Telegram sign-in bot webhook  (ESM, matches your other api files)
 // Deploy as: Lens repo -> api/tg-bot.js   (URL: https://lens-liard.vercel.app/api/tg-bot)
 //
 // Required Vercel env vars (Lens project):
 //   BOT_TOKEN                  -> from @BotFather
-//   SUPABASE_SERVICE_KEY       -> Supabase service_role key (or set SUPABASE_SERVICE_ROLE_KEY)
+//   SUPABASE_SERVICE_KEY       -> Supabase service_role key (or SUPABASE_SERVICE_ROLE_KEY)
 // Optional:
 //   SUPABASE_URL               -> defaults to your project below
 //   SITE_URL                   -> defaults to https://lnsx.io
-//   TG_WEBHOOK_SECRET          -> if set, Telegram must send it back (extra security)
+//   TG_WEBHOOK_SECRET          -> if set, Telegram must send it back
 
-const crypto = require('crypto');
+import { randomBytes } from 'crypto';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://irtfaxhvphjtqczswrck.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
@@ -19,7 +19,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const SITE_URL = (process.env.SITE_URL || 'https://lnsx.io').replace(/\/+$/, '');
 const WEBHOOK_SECRET = process.env.TG_WEBHOOK_SECRET || '';
 
-const randCode = () => crypto.randomBytes(16).toString('hex'); // 32 chars
+const randCode = () => randomBytes(16).toString('hex');
 
 async function tg(method, body) {
   const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
@@ -45,7 +45,7 @@ async function saveCode(row) {
   return r.ok;
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.method !== 'POST') { res.status(200).send('ok'); return; }
 
   if (WEBHOOK_SECRET && req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) {
@@ -90,4 +90,4 @@ module.exports = async (req, res) => {
   }
 
   res.status(200).send('ok');
-};
+}
