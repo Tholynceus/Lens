@@ -1,19 +1,21 @@
 // api/markets.js
 // Server-side market board (no browser CORS). Returns ready-to-render Base coins.
+// COIN SOURCING IS CLANKER + BANKR ONLY (their native APIs). GeckoTerminal is NOT used to
+// decide which coins appear anywhere — it can't attribute a launchpad, so it mislabels coins
+// and adds non-clanker/bankr noise. Gecko is used solely to draw OHLCV candles for a coin that
+// is already on the board (no native candle API exists on Clanker/Bankr).
+//
 // Sources (all server-side, each with timeout + UA so one slow source can't hang the fn):
-//   GeckoTerminal top pools  -> reliable TOP VOLUME backbone for all of Base (board only)
-//   Clanker API              -> launches w/ deployed-at timestamp + market fallback price
-//   Bankr launches           -> bankr-tagged launches w/ timestamp + market fallback price
+//   Clanker API     -> launches (market-cap / tx-h24 / deployed-at) w/ timestamp + market price
+//   Bankr launches  -> bankr-tagged launches w/ timestamp + market price
 // then DexScreener for live price/vol/mcap, LENS verdict attached AFTER slicing (caps lookups).
 //
 // Routes:
-//   /api/markets                 -> board, sorted by 24h volume
+//   /api/markets                 -> board, Clanker + Bankr, sorted by 24h volume
 //   /api/markets?feed=new        -> freshest CLANKER + BANKR launches, newest first (precise)
-//   /api/markets?candles=<pool>&tf=5m|1h|1d -> OHLCV candles (via GeckoTerminal)
+//   /api/markets?candles=<pool>&tf=5m|1h|1d -> OHLCV candles (GeckoTerminal, charting only)
 //
 // feed=new precision notes:
-//   - Gecko new_pools is intentionally NOT used here: it cannot attribute a launchpad, so it
-//     mislabels coins as clanker and adds non-clanker/bankr noise. It stays on the board only.
 //   - Brand-new coins are NOT dropped for missing a DexScreener pair: price falls back to the
 //     launchpad's own market data, so the freshest launches still surface.
 //   - Coins carry a real deploy timestamp (ts), are filtered to a recency window, and sorted
@@ -73,6 +75,13 @@ function num(...vals){
   return 0;
 }
 
+// Bankr returns images as ipfs:// URIs, which <img> can't load. Route them through a gateway.
+function ipfsToHttp(u){
+  if (!u || typeof u !== 'string') return u || null;
+  if (u.startsWith('ipfs://')) return 'https://ipfs.io/ipfs/' + u.slice(7).replace(/^ipfs\//, '');
+  return u;
+}
+
 async function fetchJson(url, opts = {}, timeout = 5000){
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), timeout);
@@ -87,26 +96,8 @@ async function fetchJson(url, opts = {}, timeout = 5000){
   } catch(e){ return null; } finally { clearTimeout(id); }
 }
 
-// GeckoTerminal pools -> candidates. path e.g. 'pools?include=base_token&sort=h24_volume_usd_desc'
-async function getGecko(path){
-  const j = await fetchJson(`${GECKO}/${path}`, { headers: { accept: 'application/json;version=20230203' } }, 6000);
-  if (!j) return [];
-  const data = j.data || [];
-  const inc = j.included || [];
-  const tokById = {};
-  inc.forEach(t => { if (t.type === 'token') tokById[t.id] = t.attributes || {}; });
-  const out = [];
-  data.forEach(p => {
-    const rel = p.relationships && p.relationships.base_token && p.relationships.base_token.data;
-    if (!rel) return;
-    const tk = tokById[rel.id] || {};
-    const addr = String(tk.address || (rel.id || '').split('_')[1] || '').toLowerCase();
-    if (!/^0x[a-f0-9]{40}$/.test(addr)) return;
-    if (STABLES.has(addr)) return;
-    out.push({ address: addr, src: 'clanker', name: tk.name || null, sym: tk.symbol || null, img: tk.image_url || null });
-  });
-  return out;
-}
+// GeckoTerminal is used only for OHLCV candles (see the candles route in the handler).
+// It is intentionally NOT used to source which coins appear on the board or the new feed.
 
 async function getClanker(sortBy){
   const j = await fetchJson(`${CLANKER}?chainId=8453&sortBy=${sortBy}&sort=desc&limit=20&includeMarket=true`);
@@ -114,16 +105,17 @@ async function getClanker(sortBy){
   const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
   return arr.map(o => {
     const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
-    const m = o.market || o.marketData || o.market_data || {};
+    // clanker market data lives under related.market: { price, marketCap }
+    const m = (o.related && o.related.market) || o.market || o.marketData || o.market_data || {};
     return {
       address: String(a).toLowerCase(),
       src: srcOf(o),
       name: o.name || null,
       sym: o.symbol || null,
-      img: o.img_url || o.imageUrl || o.image || null,
+      img: ipfsToHttp(o.img_url || o.imageUrl || o.imageUri || o.image || null),
       ts: tsOf(o),
-      cprice: num(o.price_usd, o.priceUsd, m.price_usd, m.priceUsd, m.price),
-      cmcap: num(o.market_cap, o.marketCap, m.market_cap, m.marketCap, o.fdv, m.fdv),
+      cprice: num(m.price, m.priceUsd, m.price_usd, o.price_usd, o.priceUsd),
+      cmcap: num(m.marketCap, m.market_cap, m.fdv, o.market_cap, o.marketCap, o.fdv),
     };
   }).filter(Boolean);
 }
@@ -135,16 +127,18 @@ async function getBankr(){
   const pickAddr = o => o.tokenAddress || o.address || o.token_address || o.contractAddress || o.ca || (o.token && (o.token.address || o.token.tokenAddress)) || null;
   return arr.map(o => {
     const a = pickAddr(o); if (!a) return null;
+    // bankr feed is Base-only in practice; skip anything else if a chain is given
+    if (o.chain && String(o.chain).toLowerCase() !== 'base') return null;
     const t = o.token || {};
-    const m = o.market || o.marketData || o.market_data || {};
     return {
       address: String(a).toLowerCase(), src: 'bankr',
-      name: o.name || o.tokenName || t.name || null,
-      sym: o.symbol || o.tokenSymbol || t.symbol || null,
-      img: o.image || o.imageUrl || o.logo || t.image || t.imageUrl || null,
+      name: o.tokenName || o.name || t.name || null,
+      sym: o.tokenSymbol || o.symbol || t.symbol || null,
+      img: ipfsToHttp(o.imageUri || o.image || o.imageUrl || o.logo || t.image || t.imageUrl || null),
       ts: tsOf(o),
-      cprice: num(o.price_usd, o.priceUsd, m.price_usd, m.priceUsd, t.price_usd, t.priceUsd),
-      cmcap: num(o.market_cap, o.marketCap, m.market_cap, m.marketCap, o.fdv),
+      // bankr launch feed carries no price/mcap; these stay 0 and DexScreener fills them in
+      cprice: num(o.price_usd, o.priceUsd),
+      cmcap: num(o.market_cap, o.marketCap, o.fdv),
     };
   }).filter(Boolean);
 }
@@ -287,14 +281,13 @@ export default async function handler(req, res){
       return res.status(200).json({ coins });
     }
 
-    // default board -> top volume across Base + clanker/bankr coverage
-    const [gtop, cap, hot, bankr] = await Promise.all([
-      getGecko('pools?include=base_token&sort=h24_volume_usd_desc'),
+    // default board -> top volume across CLANKER + BANKR (no Gecko sourcing)
+    const [cap, hot, bankr] = await Promise.all([
       getClanker('market-cap'),
       getClanker('tx-h24'),
       getBankr(),
     ]);
-    const merged = dedupe([ ...cap, ...hot, ...bankr, ...gtop ]); // clanker/bankr first => correct src tags; gecko fills
+    const merged = dedupe([ ...bankr, ...cap, ...hot ]); // bankr first => authoritative bankr tag; clanker fills
     let coins = await buildCoins(merged);
     coins.sort((a, b) => (b.vol24 || 0) - (a.vol24 || 0));
     coins = coins.slice(0, MAX);
