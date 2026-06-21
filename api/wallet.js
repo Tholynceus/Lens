@@ -28,6 +28,13 @@ const SUPABASE_KEY = process.env.LENS_SUPABASE_SERVICE_KEY
 
 const NETWORK = (process.env.CDP_NETWORK || 'base-sepolia').toLowerCase();
 const RPC = NETWORK === 'base' ? 'https://mainnet.base.org' : 'https://sepolia.base.org';
+const NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE'; // native ETH sentinel for swaps
+
+function ethToWei(eth) {
+  const [i, f = ''] = String(eth || '0').split('.');
+  const frac = (f + '0'.repeat(18)).slice(0, 18);
+  try { return BigInt(i || '0') * 1000000000000000000n + BigInt(frac || '0'); } catch (e) { return 0n; }
+}
 
 const ALLOW = ['https://lnsx.io', 'https://www.lnsx.io'];
 
@@ -133,6 +140,34 @@ export default async function handler(req, res) {
       const client = cdp();
       const privateKey = await client.evm.exportAccount({ name: accountName });
       res.status(200).json({ ok: true, address, network: NETWORK, privateKey });
+      return;
+    }
+
+    if (action === 'buy') {
+      // one-tap buy: swap native ETH -> token via CDP Swap API (mainnet only)
+      if (NETWORK !== 'base') { res.status(400).json({ ok: false, error: 'buy needs mainnet, set CDP_NETWORK=base' }); return; }
+      const to = (q.to || '').trim();
+      if (!/^0x[a-fA-F0-9]{40}$/.test(to)) { res.status(400).json({ ok: false, error: 'bad token address' }); return; }
+      const wei = ethToWei(q.amount || q.amt);
+      if (wei <= 0n) { res.status(400).json({ ok: false, error: 'bad amount' }); return; }
+      const slippageBps = Math.min(Math.max(parseInt(q.slip || '200', 10) || 200, 10), 1000); // 0.1%-10%, default 2%
+
+      const client = cdp();
+      const account = await client.evm.getOrCreateAccount({ name: accountName });
+      const quote = await account.quoteSwap({
+        network: 'base',
+        fromToken: NATIVE_ETH,
+        toToken: to,
+        fromAmount: wei,
+        slippageBps,
+      });
+      if (!quote || quote.liquidityAvailable === false) { res.status(400).json({ ok: false, error: 'no liquidity for this size' }); return; }
+      const out = await quote.execute();
+      res.status(200).json({
+        ok: true,
+        transactionHash: out.transactionHash,
+        toAmount: quote.toAmount != null ? quote.toAmount.toString() : null,
+      });
       return;
     }
 
