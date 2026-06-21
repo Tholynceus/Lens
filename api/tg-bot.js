@@ -61,7 +61,10 @@ export default async function handler(req, res) {
 
   if (msg && text.startsWith('/start')) {
     const from = msg.from || {};
-    const code = randCode();
+    // web-initiated sign-in passes a token:  /start <token>  (t.me/<bot>?start=<token>)
+    const param = (text.split(/\s+/)[1] || '').trim();
+    const isNonce = /^[a-f0-9]{16,64}$/i.test(param);
+    const code = isNonce ? param.toLowerCase() : randCode();
     const expires = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
     await saveCode({
@@ -75,18 +78,23 @@ export default async function handler(req, res) {
     });
 
     const magic = `${SITE_URL}/markets?tg_code=${code}`;
-    const body =
-      '\u{1F511} *Sign in to LENS*\n\n' +
-      'This links lnsx.io to your Telegram.\n\n' +
-      'Tap *Open LENS* below, or paste this code on the sign-in screen:\n\n' +
-      '`' + code + '`\n\n' +
-      '\u23F1 Single-use \u00B7 expires in 5 min. Keep it to yourself.';
+    const body = isNonce
+      ? ('\u2705 *Signing you in to LENS*\n\n' +
+         'Head back to the LENS tab \u2014 you are being signed in automatically.\n\n' +
+         'If it does not catch, paste this code on the sign-in screen:\n\n' +
+         '`' + code + '`\n\n' +
+         '\u23F1 Single-use \u00B7 expires in 5 min. Keep it to yourself.')
+      : ('\u{1F511} *Sign in to LENS*\n\n' +
+         'This links lnsx.io to your Telegram.\n\n' +
+         'Tap *Open LENS* below, or paste this code on the sign-in screen:\n\n' +
+         '`' + code + '`\n\n' +
+         '\u23F1 Single-use \u00B7 expires in 5 min. Keep it to yourself.');
 
     await tg('sendMessage', {
       chat_id: msg.chat.id,
       text: body,
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[{ text: '\u{1F511} Open LENS', url: magic }]] },
+      reply_markup: { inline_keyboard: [[{ text: '\u{1F511} Open LENS', url: isNonce ? `${SITE_URL}/markets` : magic }]] },
     });
   }
 
