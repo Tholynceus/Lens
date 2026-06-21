@@ -1,0 +1,233 @@
+// api/markets.js
+// Server-side market board (no browser CORS). Returns ready-to-render Base coins.
+// Sources (all server-side, each with timeout + UA so one slow source can't hang the fn):
+//   GeckoTerminal top pools  -> reliable TOP VOLUME backbone for all of Base
+//   GeckoTerminal new pools  -> freshest launches (feed=new)
+//   Clanker API              -> src tagging + extra coverage (market-cap, tx-h24, deployed-at)
+//   Bankr launches           -> bankr-tagged launches
+// then DexScreener for live price/vol/mcap, LENS verdict attached AFTER slicing (caps lookups).
+//
+// Routes:
+//   /api/markets                 -> board, sorted by 24h volume
+//   /api/markets?feed=new        -> freshest launches, newest first
+//   /api/markets?candles=<pool>&tf=5m|1h|1d -> OHLCV candles (via GeckoTerminal)
+
+const LENS_API = process.env.LENS_API || 'https://lens-liard.vercel.app';
+const MAX = parseInt(process.env.MARKETS_MAX || '30', 10);
+const BANKR_LAUNCHES = 'https://api.bankr.bot/token-launches';
+const CLANKER = 'https://www.clanker.world/api/tokens';
+const GECKO = 'https://api.geckoterminal.com/api/v2/networks/base';
+const UA = 'LENS/1.0 (+https://lnsx.io)';
+
+const STABLES = new Set([
+  '0x4200000000000000000000000000000000000006', // WETH
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // USDC
+  '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', // USDbC
+  '0x50c5725949a6f0c72e6c4a641f24049a917db0cb', // DAI
+  '0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22', // cbETH
+]);
+
+function normVerdict(v){
+  v = String(v||'').toLowerCase();
+  if (v.includes('stop')) return 'stop';
+  if (v.includes('caution') || v.includes('warn') || v.includes('risk')) return 'caution';
+  if (v.includes('clear') || v.includes('safe') || v.includes('ok')) return 'clear';
+  return 'caution';
+}
+function srcOf(tok){
+  try {
+    const blob = JSON.stringify(tok.social_context || tok.socialContext || tok.metadata || '').toLowerCase();
+    if (blob.includes('bankr')) return 'bankr';
+  } catch(e){}
+  return 'clanker';
+}
+
+async function fetchJson(url, opts = {}, timeout = 5000){
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const r = await fetch(url, {
+      ...opts,
+      signal: ctrl.signal,
+      headers: { 'user-agent': UA, accept: 'application/json', ...(opts.headers || {}) },
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch(e){ return null; } finally { clearTimeout(id); }
+}
+
+// GeckoTerminal pools -> candidates. path e.g. 'pools?include=base_token&sort=h24_volume_usd_desc'
+async function getGecko(path){
+  const j = await fetchJson(`${GECKO}/${path}`, { headers: { accept: 'application/json;version=20230203' } }, 6000);
+  if (!j) return [];
+  const data = j.data || [];
+  const inc = j.included || [];
+  const tokById = {};
+  inc.forEach(t => { if (t.type === 'token') tokById[t.id] = t.attributes || {}; });
+  const out = [];
+  data.forEach(p => {
+    const rel = p.relationships && p.relationships.base_token && p.relationships.base_token.data;
+    if (!rel) return;
+    const tk = tokById[rel.id] || {};
+    const addr = String(tk.address || (rel.id || '').split('_')[1] || '').toLowerCase();
+    if (!/^0x[a-f0-9]{40}$/.test(addr)) return;
+    if (STABLES.has(addr)) return;
+    out.push({ address: addr, src: 'clanker', name: tk.name || null, sym: tk.symbol || null, img: tk.image_url || null });
+  });
+  return out;
+}
+
+async function getClanker(sortBy){
+  const j = await fetchJson(`${CLANKER}?chainId=8453&sortBy=${sortBy}&sort=desc&limit=20&includeMarket=true`);
+  if (!j) return [];
+  const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
+  return arr.map(o => {
+    const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
+    return {
+      address: String(a).toLowerCase(),
+      src: srcOf(o),
+      name: o.name || null,
+      sym: o.symbol || null,
+      img: o.img_url || o.imageUrl || o.image || null,
+    };
+  }).filter(Boolean);
+}
+
+async function getBankr(){
+  const j = await fetchJson(BANKR_LAUNCHES);
+  if (!j) return [];
+  const arr = Array.isArray(j) ? j : (j.launches || j.data || j.results || j.tokens || j.tokenLaunches || []);
+  const pickAddr = o => o.tokenAddress || o.address || o.token_address || o.contractAddress || o.ca || (o.token && (o.token.address || o.token.tokenAddress)) || null;
+  return arr.map(o => {
+    const a = pickAddr(o); if (!a) return null;
+    return {
+      address: String(a).toLowerCase(), src: 'bankr',
+      name: o.name || o.tokenName || (o.token && o.token.name) || null,
+      sym: o.symbol || o.tokenSymbol || (o.token && o.token.symbol) || null,
+      img: o.image || o.imageUrl || o.logo || (o.token && (o.token.image || o.token.imageUrl)) || null,
+    };
+  }).filter(Boolean);
+}
+
+async function getDex(addrs){
+  const map = {};
+  if (!addrs.length) return map;
+  for (let i = 0; i < addrs.length; i += 30){
+    const chunk = addrs.slice(i, i + 30);
+    const j = await fetchJson('https://api.dexscreener.com/latest/dex/tokens/' + chunk.join(','), {}, 6000);
+    if (!j) continue;
+    (j.pairs || []).forEach(p => {
+      if (p.chainId !== 'base') return;
+      const a = (p.baseToken.address || '').toLowerCase();
+      const liq = (p.liquidity && p.liquidity.usd) || 0;
+      if (!map[a] || liq > map[a]._liq){
+        map[a] = {
+          _liq: liq,
+          pool: p.pairAddress || null,
+          name: p.baseToken.name, sym: p.baseToken.symbol,
+          price: parseFloat(p.priceUsd) || 0,
+          mcap: p.marketCap || p.fdv || 0,
+          vol24: (p.volume && p.volume.h24) || 0,
+          ch24: (p.priceChange && p.priceChange.h24) || 0,
+          img: (p.info && p.info.imageUrl) || null,
+          url: p.url,
+        };
+      }
+    });
+  }
+  return map;
+}
+
+async function getVerdict(addr){
+  const j = await fetchJson(`${LENS_API}/api/lookup?username=${encodeURIComponent(addr)}`, {}, 1800);
+  if (!j) return null;
+  const v = j.verdict || (j.read && j.read.verdict);
+  if (!v) return null;
+  return { verdict: normVerdict(v), trust: (j.trust != null ? j.trust : (j.read && j.read.trust)) };
+}
+
+function dedupe(list){
+  const seen = {}; const out = [];
+  list.forEach(x => { if (!x || !x.address || seen[x.address]) return; seen[x.address] = true; out.push(x); });
+  return out;
+}
+
+// dex enrich only (fast, no verdict)
+async function buildCoins(merged){
+  if (!merged.length) return [];
+  const dex = await getDex(merged.map(x => x.address));
+  return merged.filter(x => dex[x.address] && dex[x.address].price > 0).map(x => {
+    const d = dex[x.address];
+    return {
+      address: x.address, src: x.src,
+      sym: d.sym || x.sym || '?',
+      name: d.name || x.name || d.sym || '?',
+      price: d.price, mcap: d.mcap, vol24: d.vol24, ch24: d.ch24,
+      img: x.img || d.img || null, url: d.url || null, pool: d.pool || null,
+      verdict: 'caution', trust: null,
+    };
+  });
+}
+// attach verdicts AFTER slicing so we only ever do <= MAX lookups
+async function addVerdicts(coins){
+  await Promise.all(coins.map(async c => {
+    const v = await getVerdict(c.address);
+    if (v){ c.verdict = v.verdict; c.trust = v.trust; }
+  }));
+  return coins;
+}
+
+export default async function handler(req, res){
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Cache-Control', 's-maxage=20, stale-while-revalidate=60');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const feed = (req.query && req.query.feed) || '';
+  const candlesPool = (req.query && req.query.candles) || '';
+
+  try {
+    if (candlesPool){
+      const tf = (req.query.tf || '1h');
+      let timeframe = 'hour', aggregate = 1;
+      if (tf === '5m'){ timeframe = 'minute'; aggregate = 5; }
+      else if (tf === '15m'){ timeframe = 'minute'; aggregate = 15; }
+      else if (tf === '1h'){ timeframe = 'hour'; aggregate = 1; }
+      else if (tf === '4h'){ timeframe = 'hour'; aggregate = 4; }
+      else if (tf === '1d'){ timeframe = 'day'; aggregate = 1; }
+      const j = await fetchJson(`${GECKO}/pools/${encodeURIComponent(candlesPool)}/ohlcv/${timeframe}?aggregate=${aggregate}&limit=100&currency=usd`, { headers: { accept: 'application/json;version=20230203' } }, 6000);
+      const list = (j && j.data && j.data.attributes && j.data.attributes.ohlcv_list) || [];
+      const candles = list.slice().reverse().map(a => ({ t: a[0], o: a[1], h: a[2], l: a[3], c: a[4], v: a[5] }));
+      return res.status(200).json({ candles });
+    }
+
+    if (feed === 'new'){
+      const [gnew, fresh, bankr] = await Promise.all([
+        getGecko('new_pools?include=base_token'),
+        getClanker('deployed-at'),
+        getBankr(),
+      ]);
+      const merged = dedupe([ ...fresh, ...bankr, ...gnew ]);
+      let coins = await buildCoins(merged);
+      coins = coins.slice(0, MAX);
+      await addVerdicts(coins);
+      return res.status(200).json({ coins });
+    }
+
+    // default board -> top volume across Base + clanker/bankr coverage
+    const [gtop, cap, hot, bankr] = await Promise.all([
+      getGecko('pools?include=base_token&sort=h24_volume_usd_desc'),
+      getClanker('market-cap'),
+      getClanker('tx-h24'),
+      getBankr(),
+    ]);
+    const merged = dedupe([ ...cap, ...hot, ...bankr, ...gtop ]); // clanker/bankr first => correct src tags; gecko fills
+    let coins = await buildCoins(merged);
+    coins.sort((a, b) => (b.vol24 || 0) - (a.vol24 || 0));
+    coins = coins.slice(0, MAX);
+    await addVerdicts(coins);
+    return res.status(200).json({ coins });
+  } catch (e){
+    return res.status(500).json({ error: String((e && e.message) || e), coins: [] });
+  }
+}

@@ -68,9 +68,32 @@ async function authed(tgId, token) {
   return Array.isArray(rows) && rows.length ? rows[0] : false;
 }
 
-async function getStoredWallet(tgId) {
-  const rows = await sb(`tg_wallets?tg_user_id=eq.${encodeURIComponent(tgId)}&select=*&limit=1`);
-  return Array.isArray(rows) && rows.length ? rows[0] : null;
+function walletName(tgId, idx) { return idx > 1 ? `tg-${tgId}-${idx}` : `tg-${tgId}`; }
+
+async function getStoredWallet(tgId, idx) {
+  try {
+    const rows = await sb(`tg_wallets?tg_user_id=eq.${encodeURIComponent(tgId)}&idx=eq.${idx}&select=*&limit=1`);
+    if (Array.isArray(rows) && rows.length) return rows[0];
+  } catch (e) {}
+  // pre-migration fallback (no idx column yet): primary wallet only
+  if (Number(idx) === 1) {
+    try {
+      const rows = await sb(`tg_wallets?tg_user_id=eq.${encodeURIComponent(tgId)}&select=*&limit=1`);
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    } catch (e) {}
+  }
+  return null;
+}
+async function listWallets(tgId) {
+  try {
+    const rows = await sb(`tg_wallets?tg_user_id=eq.${encodeURIComponent(tgId)}&select=idx,address,network&order=idx.asc`);
+    if (Array.isArray(rows)) return rows.map(r => ({ idx: r.idx || 1, address: r.address, network: r.network }));
+  } catch (e) {}
+  // pre-migration fallback
+  try {
+    const rows = await sb(`tg_wallets?tg_user_id=eq.${encodeURIComponent(tgId)}&select=address,network&limit=1`);
+    return Array.isArray(rows) ? rows.map(r => ({ idx: 1, address: r.address, network: r.network })) : [];
+  } catch (e) { return []; }
 }
 
 async function ethBalance(address) {
@@ -113,13 +136,14 @@ async function getEthUsd() {
   const p = await priceUsdOf(WETH_BASE);
   return p > 0 ? p : 3400;
 }
-async function recordTrade(tgId, tokenAddr, side, ethAmount, tokenAmount, priceUsd, txHash) {
+async function recordTrade(tgId, walletIdx, tokenAddr, side, ethAmount, tokenAmount, priceUsd, txHash) {
   try {
     await sb('tg_trades', {
       method: 'POST',
       headers: { prefer: 'return=minimal' },
       body: JSON.stringify({
         tg_user_id: Number(tgId),
+        wallet_idx: Number(walletIdx) || 1,
         token_address: String(tokenAddr).toLowerCase(),
         side,
         eth_amount: Number(ethAmount) || 0,
@@ -147,11 +171,46 @@ export default async function handler(req, res) {
   const who = await authed(tgId, token);
   if (!who) { res.status(401).json({ ok: false, error: 'not authorized' }); return; }
 
-  const accountName = 'tg-' + String(tgId);
+  const w = Math.max(1, parseInt(q.w || '1', 10) || 1);
+  const accountName = walletName(tgId, w);
 
   try {
-    // ensure the CDP account exists (idempotent), then cache the address
-    let stored = await getStoredWallet(tgId);
+    // list all of the user's wallets (kept across switches, old ones never deleted)
+    if (action === 'wallets') {
+      const list = await listWallets(tgId);
+      // make sure the primary wallet exists so a brand-new user always has one
+      if (!list.length) {
+        const client = cdp();
+        const account = await client.evm.getOrCreateAccount({ name: walletName(tgId, 1) });
+        await sb('tg_wallets', {
+          method: 'POST',
+          headers: { prefer: 'resolution=merge-duplicates,return=minimal' },
+          body: JSON.stringify({ tg_user_id: Number(tgId), tg_username: who.tg_username || null, address: account.address, account_name: walletName(tgId, 1), network: NETWORK, idx: 1 }),
+        });
+        res.status(200).json({ ok: true, wallets: [{ idx: 1, address: account.address, network: NETWORK }] });
+        return;
+      }
+      res.status(200).json({ ok: true, wallets: list });
+      return;
+    }
+
+    // create an additional wallet (next index); old wallets are kept
+    if (action === 'newwallet') {
+      const list = await listWallets(tgId);
+      const nextIdx = list.reduce((m, r) => Math.max(m, r.idx || 1), 0) + 1;
+      const client = cdp();
+      const account = await client.evm.getOrCreateAccount({ name: walletName(tgId, nextIdx) });
+      await sb('tg_wallets', {
+        method: 'POST',
+        headers: { prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify({ tg_user_id: Number(tgId), tg_username: who.tg_username || null, address: account.address, account_name: walletName(tgId, nextIdx), network: NETWORK, idx: nextIdx }),
+      });
+      res.status(200).json({ ok: true, idx: nextIdx, address: account.address, network: NETWORK });
+      return;
+    }
+
+    // ensure the selected wallet exists (idempotent), then cache the address
+    let stored = await getStoredWallet(tgId, w);
     let address = stored && stored.address;
 
     if (!address) {
@@ -168,6 +227,7 @@ export default async function handler(req, res) {
           address,
           account_name: accountName,
           network: NETWORK,
+          idx: w,
         }),
       });
     }
@@ -175,8 +235,9 @@ export default async function handler(req, res) {
     if (action === 'export') {
       // owner-only export of the raw private key (their wallet, their right)
       const client = cdp();
-      const privateKey = await client.evm.exportAccount({ name: accountName });
-      res.status(200).json({ ok: true, address, network: NETWORK, privateKey });
+      let pk = await client.evm.exportAccount({ name: accountName });
+      if (pk && typeof pk === 'object') pk = pk.privateKey || pk.private_key || pk.key || pk.secret || '';
+      res.status(200).json({ ok: true, address, network: NETWORK, privateKey: String(pk || '') });
       return;
     }
 
