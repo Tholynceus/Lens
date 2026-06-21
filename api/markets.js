@@ -1,19 +1,27 @@
 // api/markets.js
 // Server-side market board (no browser CORS). Returns ready-to-render Base coins.
 // Sources (all server-side, each with timeout + UA so one slow source can't hang the fn):
-//   GeckoTerminal top pools  -> reliable TOP VOLUME backbone for all of Base
-//   GeckoTerminal new pools  -> freshest launches (feed=new)
-//   Clanker API              -> src tagging + extra coverage (market-cap, tx-h24, deployed-at)
-//   Bankr launches           -> bankr-tagged launches
+//   GeckoTerminal top pools  -> reliable TOP VOLUME backbone for all of Base (board only)
+//   Clanker API              -> launches w/ deployed-at timestamp + market fallback price
+//   Bankr launches           -> bankr-tagged launches w/ timestamp + market fallback price
 // then DexScreener for live price/vol/mcap, LENS verdict attached AFTER slicing (caps lookups).
 //
 // Routes:
 //   /api/markets                 -> board, sorted by 24h volume
-//   /api/markets?feed=new        -> freshest launches, newest first
+//   /api/markets?feed=new        -> freshest CLANKER + BANKR launches, newest first (precise)
 //   /api/markets?candles=<pool>&tf=5m|1h|1d -> OHLCV candles (via GeckoTerminal)
+//
+// feed=new precision notes:
+//   - Gecko new_pools is intentionally NOT used here: it cannot attribute a launchpad, so it
+//     mislabels coins as clanker and adds non-clanker/bankr noise. It stays on the board only.
+//   - Brand-new coins are NOT dropped for missing a DexScreener pair: price falls back to the
+//     launchpad's own market data, so the freshest launches still surface.
+//   - Coins carry a real deploy timestamp (ts), are filtered to a recency window, and sorted
+//     newest-first, so "new" means recently deployed, not just newly-seen.
 
 const LENS_API = process.env.LENS_API || 'https://lens-liard.vercel.app';
 const MAX = parseInt(process.env.MARKETS_MAX || '30', 10);
+const NEW_WINDOW_MIN = parseInt(process.env.NEW_WINDOW_MIN || '120', 10); // freshness window for feed=new
 const BANKR_LAUNCHES = 'https://api.bankr.bot/token-launches';
 const CLANKER = 'https://www.clanker.world/api/tokens';
 const GECKO = 'https://api.geckoterminal.com/api/v2/networks/base';
@@ -40,6 +48,29 @@ function srcOf(tok){
     if (blob.includes('bankr')) return 'bankr';
   } catch(e){}
   return 'clanker';
+}
+
+// robust deploy-timestamp parser -> epoch ms, or null if unknown.
+// handles ISO strings, unix seconds, and unix ms across a bunch of field names.
+function tsOf(o){
+  const cand =
+    o.created_at ?? o.createdAt ?? o.deployed_at ?? o.deployedAt ??
+    o.launchedAt ?? o.launched_at ?? o.launch_time ?? o.launchTime ??
+    o.timestamp ?? o.block_timestamp ?? o.blockTimestamp ??
+    (o.pool && (o.pool.created_at || o.pool.createdAt)) ??
+    (o.token && (o.token.created_at || o.token.createdAt || o.token.deployedAt)) ?? null;
+  if (cand == null) return null;
+  if (typeof cand === 'number'){
+    return cand < 1e12 ? Math.round(cand * 1000) : Math.round(cand); // seconds vs ms
+  }
+  const n = Date.parse(cand);
+  return isNaN(n) ? null : n;
+}
+
+// first positive number from a list of candidates, else 0
+function num(...vals){
+  for (const v of vals){ const n = parseFloat(v); if (isFinite(n) && n > 0) return n; }
+  return 0;
 }
 
 async function fetchJson(url, opts = {}, timeout = 5000){
@@ -83,12 +114,16 @@ async function getClanker(sortBy){
   const arr = Array.isArray(j) ? j : (j.data || j.tokens || []);
   return arr.map(o => {
     const a = o.contract_address || o.contractAddress || o.address; if (!a) return null;
+    const m = o.market || o.marketData || o.market_data || {};
     return {
       address: String(a).toLowerCase(),
       src: srcOf(o),
       name: o.name || null,
       sym: o.symbol || null,
       img: o.img_url || o.imageUrl || o.image || null,
+      ts: tsOf(o),
+      cprice: num(o.price_usd, o.priceUsd, m.price_usd, m.priceUsd, m.price),
+      cmcap: num(o.market_cap, o.marketCap, m.market_cap, m.marketCap, o.fdv, m.fdv),
     };
   }).filter(Boolean);
 }
@@ -100,11 +135,16 @@ async function getBankr(){
   const pickAddr = o => o.tokenAddress || o.address || o.token_address || o.contractAddress || o.ca || (o.token && (o.token.address || o.token.tokenAddress)) || null;
   return arr.map(o => {
     const a = pickAddr(o); if (!a) return null;
+    const t = o.token || {};
+    const m = o.market || o.marketData || o.market_data || {};
     return {
       address: String(a).toLowerCase(), src: 'bankr',
-      name: o.name || o.tokenName || (o.token && o.token.name) || null,
-      sym: o.symbol || o.tokenSymbol || (o.token && o.token.symbol) || null,
-      img: o.image || o.imageUrl || o.logo || (o.token && (o.token.image || o.token.imageUrl)) || null,
+      name: o.name || o.tokenName || t.name || null,
+      sym: o.symbol || o.tokenSymbol || t.symbol || null,
+      img: o.image || o.imageUrl || o.logo || t.image || t.imageUrl || null,
+      ts: tsOf(o),
+      cprice: num(o.price_usd, o.priceUsd, m.price_usd, m.priceUsd, t.price_usd, t.priceUsd),
+      cmcap: num(o.market_cap, o.marketCap, m.market_cap, m.marketCap, o.fdv),
     };
   }).filter(Boolean);
 }
@@ -152,7 +192,7 @@ function dedupe(list){
   return out;
 }
 
-// dex enrich only (fast, no verdict)
+// BOARD enrich: dex only, drops price-less (board is volume-driven, needs live price)
 async function buildCoins(merged){
   if (!merged.length) return [];
   const dex = await getDex(merged.map(x => x.address));
@@ -168,6 +208,33 @@ async function buildCoins(merged){
     };
   });
 }
+
+// NEW-FEED enrich: keep ts, fall back to launchpad market price so the freshest coins still
+// surface before DexScreener has indexed them. Only skip a coin if NO price exists anywhere.
+async function buildCoinsNew(merged){
+  if (!merged.length) return [];
+  const dex = await getDex(merged.map(x => x.address));
+  return merged.map(x => {
+    const d = dex[x.address] || null;
+    const price = (d && d.price > 0) ? d.price : (x.cprice || 0);
+    if (!(price > 0)) return null; // too fresh to price anywhere -> it'll show next poll
+    return {
+      address: x.address, src: x.src,
+      sym: (d && d.sym) || x.sym || '?',
+      name: (d && d.name) || x.name || (d && d.sym) || x.sym || '?',
+      price,
+      mcap: (d && d.mcap) || x.cmcap || 0,
+      vol24: (d && d.vol24) || 0,
+      ch24: (d && d.ch24) || 0,
+      img: x.img || (d && d.img) || null,
+      url: (d && d.url) || null,
+      pool: (d && d.pool) || null,
+      ts: x.ts || null,
+      verdict: 'caution', trust: null,
+    };
+  }).filter(Boolean);
+}
+
 // attach verdicts AFTER slicing so we only ever do <= MAX lookups
 async function addVerdicts(coins){
   await Promise.all(coins.map(async c => {
@@ -202,13 +269,19 @@ export default async function handler(req, res){
     }
 
     if (feed === 'new'){
-      const [gnew, fresh, bankr] = await Promise.all([
-        getGecko('new_pools?include=base_token'),
+      // Clanker + Bankr only, from their native "new" endpoints. Bankr listed first so a coin
+      // that appears in Bankr's own launch feed keeps the authoritative bankr tag; clanker fills.
+      const [fresh, bankr] = await Promise.all([
         getClanker('deployed-at'),
         getBankr(),
       ]);
-      const merged = dedupe([ ...fresh, ...bankr, ...gnew ]);
-      let coins = await buildCoins(merged);
+      const merged = dedupe([ ...bankr, ...fresh ]);
+      let coins = await buildCoinsNew(merged);
+      // precision: keep only genuinely recent coins. unknown ts is kept (the source endpoints are
+      // already recency-ordered) but ranked after timestamped ones.
+      const cutoff = Date.now() - NEW_WINDOW_MIN * 60 * 1000;
+      coins = coins.filter(c => c.ts == null || c.ts >= cutoff);
+      coins.sort((a, b) => (b.ts || 0) - (a.ts || 0));
       coins = coins.slice(0, MAX);
       await addVerdicts(coins);
       return res.status(200).json({ coins });
