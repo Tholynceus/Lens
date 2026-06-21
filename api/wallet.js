@@ -94,6 +94,43 @@ function cdp() {
   });
 }
 
+// ---- price + trade ledger (powers REAL PnL) ----
+const WETH_BASE = '0x4200000000000000000000000000000000000006';
+async function priceUsdOf(addr) {
+  try {
+    const r = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + addr);
+    const j = await r.json();
+    let best = 0, liq = -1;
+    (j.pairs || []).forEach(p => {
+      if (p.chainId !== 'base') return;
+      const l = (p.liquidity && p.liquidity.usd) || 0;
+      if (l > liq) { liq = l; best = parseFloat(p.priceUsd) || 0; }
+    });
+    return best;
+  } catch (e) { return 0; }
+}
+async function getEthUsd() {
+  const p = await priceUsdOf(WETH_BASE);
+  return p > 0 ? p : 3400;
+}
+async function recordTrade(tgId, tokenAddr, side, ethAmount, tokenAmount, priceUsd, txHash) {
+  try {
+    await sb('tg_trades', {
+      method: 'POST',
+      headers: { prefer: 'return=minimal' },
+      body: JSON.stringify({
+        tg_user_id: Number(tgId),
+        token_address: String(tokenAddr).toLowerCase(),
+        side,
+        eth_amount: Number(ethAmount) || 0,
+        token_amount: Number(tokenAmount) || 0,
+        price_usd: Number(priceUsd) || 0,
+        tx_hash: txHash || null,
+      }),
+    });
+  } catch (e) {}
+}
+
 export default async function handler(req, res) {
   cors(req, res);
   if (req.method === 'OPTIONS') { res.status(204).end(); return; }
@@ -163,10 +200,137 @@ export default async function handler(req, res) {
       });
       if (!quote || quote.liquidityAvailable === false) { res.status(400).json({ ok: false, error: 'no liquidity for this size' }); return; }
       const out = await quote.execute();
+      // log the trade so PnL is computed from real fills (best-effort)
+      try {
+        const ethAmt = Number(q.amount || q.amt) || 0;
+        const px = await priceUsdOf(to);
+        const ethUsd = await getEthUsd();
+        const tokAmt = px > 0 ? (ethAmt * ethUsd) / px : 0;
+        await recordTrade(tgId, to, 'buy', ethAmt, tokAmt, px, out.transactionHash);
+      } catch (e) {}
       res.status(200).json({
         ok: true,
         transactionHash: out.transactionHash,
         toAmount: quote.toAmount != null ? quote.toAmount.toString() : null,
+      });
+      return;
+    }
+
+    if (action === 'tokens') {
+      const client = cdp();
+      let out = [];
+      try {
+        const r = await client.evm.listTokenBalances({ address, network: NETWORK });
+        out = (r.balances || []).map(b => {
+          const dec = (b.amount && b.amount.decimals) || 18;
+          const raw = (b.amount && b.amount.amount) || '0';
+          return {
+            address: b.token.contractAddress,
+            symbol: b.token.symbol || null,
+            decimals: dec,
+            raw: String(raw),
+            amount: Number(raw) / Math.pow(10, dec),
+          };
+        }).filter(t => t.amount > 0 && t.address && t.address.toLowerCase() !== '0x0000000000000000000000000000000000000000');
+      } catch (e) {}
+      res.status(200).json({ ok: true, tokens: out });
+      return;
+    }
+
+    if (action === 'sell') {
+      // swap token -> native ETH (mainnet only)
+      if (NETWORK !== 'base') { res.status(400).json({ ok: false, error: 'sell needs mainnet, set CDP_NETWORK=base' }); return; }
+      const from = (q.from || '').trim();
+      if (!/^0x[a-fA-F0-9]{40}$/.test(from)) { res.status(400).json({ ok: false, error: 'bad token address' }); return; }
+      const slippageBps = Math.min(Math.max(parseInt(q.slip || '200', 10) || 200, 10), 1000);
+
+      const client = cdp();
+      const account = await client.evm.getOrCreateAccount({ name: accountName });
+      const bals = await client.evm.listTokenBalances({ address, network: 'base' });
+      const tb = (bals.balances || []).find(b => b.token.contractAddress.toLowerCase() === from.toLowerCase());
+      if (!tb) { res.status(400).json({ ok: false, error: 'you do not hold this token' }); return; }
+
+      let rawAmt = BigInt(tb.amount.amount);
+      if (q.raw) { try { rawAmt = BigInt(q.raw); } catch (e) {} }
+      else { const pct = Math.min(Math.max(parseInt(q.percent || '100', 10) || 100, 1), 100); rawAmt = rawAmt * BigInt(pct) / 100n; }
+      if (rawAmt <= 0n) { res.status(400).json({ ok: false, error: 'nothing to sell' }); return; }
+
+      const quote = await account.quoteSwap({ network: 'base', fromToken: from, toToken: NATIVE_ETH, fromAmount: rawAmt, slippageBps });
+      if (!quote || quote.liquidityAvailable === false) { res.status(400).json({ ok: false, error: 'no liquidity for this size' }); return; }
+      const out = await quote.execute();
+      // log the sell so realized PnL is tracked (best-effort)
+      try {
+        const dec = (tb.amount && tb.amount.decimals) || 18;
+        const tokAmt = Number(rawAmt) / Math.pow(10, dec);
+        const px = await priceUsdOf(from);
+        const ethUsd = await getEthUsd();
+        const ethAmt = (px > 0 && ethUsd > 0) ? (tokAmt * px) / ethUsd : 0;
+        await recordTrade(tgId, from, 'sell', ethAmt, tokAmt, px, out.transactionHash);
+      } catch (e) {}
+      res.status(200).json({ ok: true, transactionHash: out.transactionHash });
+      return;
+    }
+
+    if (action === 'pnl') {
+      // REAL PnL from the trade ledger + current balances + live prices
+      const trades = (await sb(`tg_trades?tg_user_id=eq.${encodeURIComponent(tgId)}&select=token_address,side,eth_amount,token_amount,price_usd&order=created_at.asc`)) || [];
+
+      // current on-chain balances
+      const balances = {};
+      try {
+        const client = cdp();
+        const r = await client.evm.listTokenBalances({ address, network: NETWORK });
+        (r.balances || []).forEach(b => {
+          const dec = (b.amount && b.amount.decimals) || 18;
+          const raw = (b.amount && b.amount.amount) || '0';
+          balances[b.token.contractAddress.toLowerCase()] = Number(raw) / Math.pow(10, dec);
+        });
+      } catch (e) {}
+
+      // aggregate trades per token
+      const byTok = {};
+      trades.forEach(t => {
+        const a = String(t.token_address).toLowerCase();
+        if (!byTok[a]) byTok[a] = { buyTok: 0, buyUsd: 0, sellTok: 0, sellUsd: 0 };
+        const g = byTok[a];
+        const tok = Number(t.token_amount) || 0;
+        const usd = tok * (Number(t.price_usd) || 0);
+        if (t.side === 'buy') { g.buyTok += tok; g.buyUsd += usd; }
+        else { g.sellTok += tok; g.sellUsd += usd; }
+      });
+
+      // live prices for everything held or traded
+      const addrs = Array.from(new Set([...Object.keys(byTok), ...Object.keys(balances)]));
+      const priceMap = {};
+      await Promise.all(addrs.map(async a => { priceMap[a] = await priceUsdOf(a); }));
+
+      let totPnl = 0, totValue = 0, totCost = 0, totReal = 0;
+      const positions = addrs.map(a => {
+        const g = byTok[a] || { buyTok: 0, buyUsd: 0, sellTok: 0, sellUsd: 0 };
+        const held = balances[a] || 0;
+        const avgBuy = g.buyTok > 0 ? g.buyUsd / g.buyTok : 0;     // avg cost (usd/token)
+        const realized = g.sellUsd - g.sellTok * avgBuy;
+        const price = priceMap[a] || 0;
+        const value = held * price;
+        const costRemain = held * avgBuy;
+        const unrealized = value - costRemain;
+        const pnl = realized + unrealized;
+        totPnl += pnl; totValue += value; totCost += costRemain; totReal += realized;
+        return {
+          address: a, held, avgBuyUsd: avgBuy, price,
+          valueUsd: value, costUsd: costRemain,
+          realizedUsd: realized, unrealizedUsd: unrealized, pnlUsd: pnl,
+          pnlPct: costRemain > 0 ? (unrealized / costRemain * 100) : null,
+        };
+      }).filter(p => p.held > 0 || Math.abs(p.realizedUsd) > 1e-6);
+
+      res.status(200).json({
+        ok: true,
+        positions,
+        totals: {
+          pnlUsd: totPnl, valueUsd: totValue, costUsd: totCost, realizedUsd: totReal,
+          pnlPct: totCost > 0 ? ((totValue - totCost) / totCost * 100) : null,
+        },
       });
       return;
     }
