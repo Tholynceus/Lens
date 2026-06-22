@@ -220,9 +220,11 @@ async function lookupProfile({ username, wallet }) {
   }
 
   const sells = [];
+  const WETH_BASE = '0x4200000000000000000000000000000000000006';
   for (const token of tokens.slice(0, 4)) {
     if (!token.deployer_wallet || !token.token_address) continue;
     try {
+      // token leaving the deployer wallet
       const result = await alchemyRpc('alchemy_getAssetTransfers', [{
         fromAddress: token.deployer_wallet,
         contractAddresses: [token.token_address],
@@ -234,10 +236,39 @@ async function lookupProfile({ username, wallet }) {
       }]);
       const out = result?.transfers || [];
       if (!out.length) continue;
-      const total = out.reduce((s, tx) => s + (tx.value || 0), 0);
+
+      // A REAL sell pays the deployer back in WETH/ETH in the SAME transaction.
+      // Liquidity seeding at launch (deployer -> pool/LP locker) sends tokens out with
+      // NO WETH/ETH coming back, so it must NOT be counted as a dev sell.
+      const proceedsHashes = new Set();
+      try {
+        const wethIn = await alchemyRpc('alchemy_getAssetTransfers', [{
+          toAddress: token.deployer_wallet,
+          contractAddresses: [WETH_BASE],
+          category: ['erc20'],
+          order: 'desc',
+          excludeZeroValue: true,
+          maxCount: '0x3e8',
+        }]);
+        for (const t of (wethIn?.transfers || [])) if (t.hash) proceedsHashes.add(t.hash.toLowerCase());
+        const ethIn = await alchemyRpc('alchemy_getAssetTransfers', [{
+          toAddress: token.deployer_wallet,
+          category: ['external', 'internal'],
+          order: 'desc',
+          excludeZeroValue: true,
+          maxCount: '0x3e8',
+        }]);
+        for (const t of (ethIn?.transfers || [])) if (t.hash) proceedsHashes.add(t.hash.toLowerCase());
+      } catch {}
+
+      // keep only token-out transfers that returned WETH/ETH to the dev = actual sells
+      const realSells = out.filter(tx => tx.hash && proceedsHashes.has(tx.hash.toLowerCase()));
+      if (!realSells.length) continue; // liquidity seeding / plain transfers, not a sell
+
+      const total = realSells.reduce((s, tx) => s + (tx.value || 0), 0);
       const fmt = n => n < 1000 ? n.toFixed(2) : n < 1e6 ? `${(n/1000).toFixed(1)}K` : `${(n/1e6).toFixed(1)}M`;
       const fmtDate = ts => ts ? new Date(ts).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null;
-      sells.push({ token_address: token.token_address, token_symbol: token.token_symbol, sell_count: out.length, total_sold: fmt(total), first_sell: fmtDate(out[out.length-1].metadata?.blockTimestamp), last_sell: fmtDate(out[0].metadata?.blockTimestamp) });
+      sells.push({ token_address: token.token_address, token_symbol: token.token_symbol, sell_count: realSells.length, total_sold: fmt(total), first_sell: fmtDate(realSells[realSells.length-1].metadata?.blockTimestamp), last_sell: fmtDate(realSells[0].metadata?.blockTimestamp) });
     } catch {}
   }
 
