@@ -188,22 +188,31 @@ function dedupe(list){
   return out;
 }
 
-// BOARD enrich: dex only, drops price-less (board is volume-driven, needs live price)
+// BOARD enrich: prefer live DexScreener data, but fall back to the launchpad's own
+// market price (Clanker carries price+mcap) so freshly deployed coins that DexScreener
+// has not indexed yet still populate the board. Only skip a coin with no price anywhere.
 async function buildCoins(merged){
   if (!merged.length) return [];
   const dex = await getDex(merged.map(x => x.address));
-  return merged.filter(x => dex[x.address] && dex[x.address].price > 0).map(x => {
-    const d = dex[x.address];
+  return merged.map(x => {
+    const d = dex[x.address] || null;
+    const price = (d && d.price > 0) ? d.price : (x.cprice || 0);
+    if (!(price > 0)) return null; // no price on dex or launchpad -> shows once it gets priced
     return {
       address: x.address, src: x.src,
-      sym: d.sym || x.sym || '?',
-      name: d.name || x.name || d.sym || '?',
-      price: d.price, mcap: d.mcap, vol24: d.vol24, ch24: d.ch24,
-      img: x.img || d.img || null, url: d.url || null, pool: d.pool || null,
+      sym: (d && d.sym) || x.sym || '?',
+      name: (d && d.name) || x.name || (d && d.sym) || x.sym || '?',
+      price,
+      mcap: (d && d.mcap) || x.cmcap || 0,
+      vol24: (d && d.vol24) || 0,
+      ch24: (d && d.ch24) || 0,
+      img: x.img || (d && d.img) || null,
+      url: (d && d.url) || null,
+      pool: (d && d.pool) || null,
       ts: x.ts || null,
       verdict: 'caution', trust: null,
     };
-  });
+  }).filter(Boolean);
 }
 
 // NEW-FEED enrich: keep ts, fall back to launchpad market price so the freshest coins still
