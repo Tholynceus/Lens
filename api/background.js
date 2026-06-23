@@ -409,11 +409,26 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
 
       // Merge & deduplicate by hash
       const seen = new Set();
-      const allClaims = [...intClaims, ...extClaims].filter(tx => {
+      let allClaims = [...intClaims, ...extClaims].filter(tx => {
         if (seen.has(tx.hash)) return false;
         seen.add(tx.hash);
         return true;
-      }).sort((a, b) => new Date(b.metadata?.blockTimestamp) - new Date(a.metadata?.blockTimestamp));
+      });
+
+      // A fee claim is paid out BY A CONTRACT (the pool / fee locker). Plain ETH sent
+      // from another wallet (gas funding, a transfer from an exchange) is NOT a claim,
+      // so require the sender to be a contract. Kills "dev claimed" false positives.
+      const senders = [...new Set(allClaims.map(tx => (tx.from || '').toLowerCase()).filter(Boolean))];
+      const isContractSrc = {};
+      await Promise.all(senders.map(async addr => {
+        try {
+          const code = await alchemyRpc(ALCHEMY_KEY, 'eth_getCode', [addr, 'latest']);
+          isContractSrc[addr] = !!(code && code !== '0x' && code.length > 2);
+        } catch (e) { isContractSrc[addr] = false; }
+      }));
+      allClaims = allClaims
+        .filter(tx => isContractSrc[(tx.from || '').toLowerCase()])
+        .sort((a, b) => new Date(b.metadata?.blockTimestamp) - new Date(a.metadata?.blockTimestamp));
 
       if (allClaims.length > 0) {
         const totalEth = allClaims.reduce((s, tx) => s + (tx.value || 0), 0);

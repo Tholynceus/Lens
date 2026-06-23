@@ -44,9 +44,14 @@ export default async function handler(req, res) {
       if (!w) { w = { wallet: m.wallet, chain: m.chain, in_bio: false, tweet_count: 0, deleted_count: 0, tweets: [] }; byWallet.set(m.wallet, w); }
       if (m.source === 'bio' || !t) { w.in_bio = true; continue; }
       w.tweet_count += 1;
-      if (t.deleted) w.deleted_count += 1;
+      // Never surface a deletion for a very recent tweet (< 48h): timelines churn right
+      // after posting and the deletion heuristic is unreliable that early. This also
+      // clears any false flags already written for fresh launch tweets.
+      const recent = t.created_at && (Date.now() - new Date(t.created_at).getTime() < 48 * 3600 * 1000);
+      const isDeleted = !!t.deleted && !recent;
+      if (isDeleted) w.deleted_count += 1;
       w.tweets.push({
-        text: t.text, created_at: t.created_at, deleted: !!t.deleted, deleted_at: t.deleted_at,
+        text: t.text, created_at: t.created_at, deleted: isDeleted, deleted_at: isDeleted ? t.deleted_at : null,
         likes: t.like_count, retweets: t.retweet_count, replies: t.reply_count,
       });
     }

@@ -8,7 +8,7 @@
 const SUPABASE_URL = process.env.LENS_SUPABASE_URL;
 const SERVICE_KEY = process.env.LENS_SUPABASE_SERVICE_KEY;
 const REST = `${SUPABASE_URL}/rest/v1`;
-const MISS_THRESHOLD = 2;
+const MISS_THRESHOLD = 5;
 
 function H(prefer) {
   const h = { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}`, 'Content-Type': 'application/json' };
@@ -85,9 +85,14 @@ export default async function handler(req, res) {
     }
 
     // Deletion detection within the reported visible range.
-    if (range.oldest && range.newest) {
+    // False-positive guards: only trust a real scrape (>= 4 tweets seen), never flag
+    // very recent tweets (< 48h, timelines churn right after posting), and require
+    // MISS_THRESHOLD independent misses before marking deleted.
+    if (range.oldest && range.newest && seenIds.length >= 4) {
+      const cutoff = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
       const q = `/tweets?username=eq.${encodeURIComponent(username)}` +
         `&created_at=gte.${encodeURIComponent(range.oldest)}&created_at=lte.${encodeURIComponent(range.newest)}` +
+        `&created_at=lt.${encodeURIComponent(cutoff)}` +
         `&deleted=eq.false&select=id,miss_count`;
       const stored = await sbGet(q);
       const missing = (stored || []).filter(s => !seenIds.includes(s.id));
