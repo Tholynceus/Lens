@@ -32,7 +32,7 @@ const PERSONA = [
   'You can do three things: (1) analyze a contract address or a $ticker (you can resolve a ticker to its token and report its deployer, fee share, and how many times the dev has claimed fees), (2) analyze an X account or deployer, (3) answer questions about LENS itself and about on-chain / crypto topics.',
   'Stay on topic: LENS, on-chain and crypto, plus light friendly chat. If the user brings up sexual, pornographic, vulgar, hateful, illegal, or clearly unrelated content, do NOT engage with it. Briefly and politely decline and steer the conversation back to what LENS can help with.',
   'Use ONLY the DATA and DOCS provided for facts. Never invent specific numbers, token stats, names, or features. If you do not know, say so.',
-  'When the DATA includes "Smart follower handles", actually name a few of them by @handle in your reply (for example "notable smart followers include @a, @b, @c"), not just the count. List up to 6 of the provided handles verbatim and never invent handles that were not given.',
+  'When the DATA includes "Smart follower handles", actually name a few of them in your reply, not just the count. Render each as a markdown link to their X profile, like [@handle](https://x.com/handle). List up to 6 of the provided handles verbatim and never invent handles that were not given.',
   'Only when you actually have token or account DATA, format it as: one bold summary line, then 3 to 6 short bullets. If the DATA includes a VERDICT (CLEAR, CAUTION, or STOP) with red lines, end with that verdict as a bold line (for example **Verdict: CAUTION**) and then list only the red lines marked TRIGGERED, in plain words, using the verdict and red lines exactly as given without inventing or renaming any. If the data has no VERDICT (for example an account lookup), end with a final "Risk read: LOW | MEDIUM | HIGH" line instead. For normal conversation, just reply naturally in a sentence or two, no forced format.',
   'Reply in the same language the user writes in (for example English, Chinese, Russian, Spanish, French, Vietnamese, Thai). Never reply in Indonesian or Malay: if the user writes in Indonesian or Malay, reply in English instead. If the language is unclear or mixed, default to English. Keep replies tight and clear. This is information, not financial advice, and never tell people to buy or sell.',
   'Never use dash punctuation: no em dash, no en dash, and no double hyphen. Use commas, periods, or shorter sentences instead. A single hyphen inside a real compound word like on-chain is fine.',
@@ -127,6 +127,37 @@ async function sb(path) {
   });
 }
 
+// Live on-chain claim detection via the /api/alchemy proxy (matches FARGRAM).
+// A fee claim pays the recipient BOTH the token AND WETH in the same tx.
+async function liveClaims(recipient, tokenCA) {
+  const WETH = '0x4200000000000000000000000000000000000006';
+  const r = String(recipient || '').toLowerCase();
+  const tok = String(tokenCA || '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(r) || !/^0x[0-9a-f]{40}$/.test(tok)) return null;
+  const ask = (contract) => getJSON(`${SELF}/api/alchemy`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method: 'alchemy_getAssetTransfers', params: [{
+      toAddress: r, contractAddresses: [contract], category: ['erc20'],
+      order: 'desc', withMetadata: true, excludeZeroValue: true, maxCount: '0x3e8',
+    }] }),
+  });
+  try {
+    const [w, t] = await Promise.all([ask(WETH), ask(tok)]);
+    const wt = (w && w.result && w.result.transfers) || [];
+    const tt = (t && t.result && t.result.transfers) || [];
+    const wethByTx = new Map();
+    for (const x of wt) { const h = String(x.hash || '').toLowerCase(); if (h) wethByTx.set(h, (wethByTx.get(h) || 0) + (x.value || 0)); }
+    const done = new Set(); let count = 0, weth = 0; const txs = [];
+    for (const x of tt) {
+      const h = String(x.hash || '').toLowerCase();
+      if (!h || done.has(h) || !wethByTx.has(h)) continue;
+      done.add(h); count++; weth += wethByTx.get(h);
+      txs.push({ hash: h, weth: wethByTx.get(h), ts: x.metadata?.blockTimestamp || null });
+    }
+    return count > 0 ? { count, weth, txs } : null;
+  } catch { return null; }
+}
+
 // CA -> Bankrbot launch record: deployer, fee share, claim count, unclaimed
 async function bankrByCA(ca) {
   const c = ca.toLowerCase();
@@ -136,7 +167,15 @@ async function bankrByCA(ca) {
   let claimCount = t.fee_claimed_count != null ? Number(t.fee_claimed_count) : null;
   let claimedEth = null;
   const dw = (t.deployer_wallet || '').toLowerCase();
-  if (/^0x[0-9a-f]{40}$/.test(dw)) {
+  const fw = (t.fee_recipient_wallet || '').toLowerCase();
+  // Live first (real-time truth), fall back to cron cache if live finds nothing.
+  const live = await liveClaims(fw || dw, c);
+  let claimTxs = [];
+  if (live) {
+    claimCount = live.count;
+    claimedEth = live.weth;
+    claimTxs = live.txs || [];
+  } else if (/^0x[0-9a-f]{40}$/.test(dw)) {
     const ch = await sb(`bankr_claim_history?deployer_wallet=eq.${dw}&select=total_eth_claimed,claim_count`);
     if (ch && ch.length) {
       claimedEth = ch.reduce((s, r) => s + parseFloat(r.total_eth_claimed || 0), 0);
@@ -144,7 +183,6 @@ async function bankrByCA(ca) {
       if (cc) claimCount = cc;
     }
   }
-  const fw = (t.fee_recipient_wallet || '').toLowerCase();
   return {
     isBankr: true,
     deployer_x: t.x_username || null,
@@ -153,6 +191,7 @@ async function bankrByCA(ca) {
     has_claimed: !!t.fee_has_claimed || (claimCount != null && claimCount > 0),
     claim_count: claimCount,
     claimed_eth: claimedEth != null ? claimedEth.toFixed(4) : null,
+    claim_txs: claimTxs,
     is_pleasebro: !!(dw && fw && dw !== fw),
   };
 }
@@ -467,6 +506,19 @@ export default async function handler(req, res) {
     if (!answer && msg.reasoning_content) answer = String(msg.reasoning_content);
 
     answer = stripDashes(answer.trim());
+
+    // Deterministic claim-tx links: tx hashes are 66 chars, so never let the LLM
+    // rewrite them. Append correct Basescan links from the data we already fetched.
+    const claimTxs = (data && data.bankr && data.bankr.claim_txs)
+      || (data && data.claims && data.claims.claim_txs) || [];
+    if (claimTxs.length) {
+      const links = claimTxs.slice(0, 6).map((x, i) => {
+        const label = x.weth ? `${Number(x.weth).toFixed(4)} weth` : `tx ${i + 1}`;
+        return `[${label}](https://basescan.org/tx/${x.hash})`;
+      }).join(', ');
+      answer += `\n\n**Claim txs:** ${links}`;
+    }
+
     return res.status(200).json({ ok: true, type: det.type, data, answer, model: LLM_MODEL });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String((e && e.message) || e) });

@@ -147,6 +147,53 @@ async function alchemyRpc(method, params) {
   return json.result;
 }
 
+// ── Live on-chain dev-fee-claim detection (matches FARGRAM, no cron dependency) ──
+// A Bankr/Doppler fee claim pays the fee recipient BOTH the project token AND WETH
+// in the SAME tx. We pull token-in + WETH-in to the recipient, group by tx hash,
+// and count a tx as a claim when both are present. Returns { count, weth, lastTs }.
+async function computeClaimsLive(tokens) {
+  const WETH_BASE = '0x4200000000000000000000000000000000000006';
+  let count = 0, weth = 0, lastTs = 0; const txs = [];
+  const seen = new Set();
+  for (const token of (tokens || []).slice(0, 4)) {
+    const dw = String(token.fee_recipient_wallet || token.deployer_wallet || '').toLowerCase();
+    const tok = String(token.token_address || '').toLowerCase();
+    if (!dw || !tok || !isAddr(dw) || !isAddr(tok)) continue;
+    const key = `${dw}:${tok}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const [wethRes, tokRes] = await Promise.all([
+        alchemyRpc('alchemy_getAssetTransfers', [{
+          toAddress: dw, contractAddresses: [WETH_BASE], category: ['erc20'],
+          order: 'desc', withMetadata: true, excludeZeroValue: true, maxCount: '0x3e8',
+        }]),
+        alchemyRpc('alchemy_getAssetTransfers', [{
+          toAddress: dw, contractAddresses: [tok], category: ['erc20'],
+          order: 'desc', withMetadata: true, excludeZeroValue: true, maxCount: '0x3e8',
+        }]),
+      ]);
+      const wethByTx = new Map();
+      for (const t of (wethRes?.transfers || [])) {
+        const h = String(t.hash || '').toLowerCase();
+        if (h) wethByTx.set(h, (wethByTx.get(h) || 0) + (t.value || 0));
+      }
+      const counted = new Set();
+      for (const t of (tokRes?.transfers || [])) {
+        const h = String(t.hash || '').toLowerCase();
+        if (!h || counted.has(h) || !wethByTx.has(h)) continue;
+        counted.add(h);
+        count++;
+        weth += wethByTx.get(h);
+        const ts = Date.parse(t.metadata?.blockTimestamp || '') || 0;
+        if (ts > lastTs) lastTs = ts;
+        txs.push({ hash: h, weth: wethByTx.get(h), ts: t.metadata?.blockTimestamp || null });
+      }
+    } catch {}
+  }
+  return { count, weth, lastTs, txs };
+}
+
 async function lookupProfile({ username, wallet }) {
   let tokens = [];
   let pleaseBroTokens = []; // tokens where user is fee recipient (PleaseBro)
@@ -279,9 +326,17 @@ async function lookupProfile({ username, wallet }) {
   const holderStats = await computeHolderStats(tokens.slice(0, 4));
 
   const totalUnclaimedUsd = tokens.reduce((s, t) => s + parseFloat(t.unclaimed_usd || 0), 0);
-  const totalClaimedEth = claimData.reduce((s, c) => s + parseFloat(c.total_eth_claimed || 0), 0);
+  const cachedClaimedEth = claimData.reduce((s, c) => s + parseFloat(c.total_eth_claimed || 0), 0);
+  const cachedClaimCount = claimData.reduce((s, c) => s + (parseInt(c.claim_count) || 0), 0);
   const hasNewToken = tokens.some(t => t.is_new);
-  const hasClaimed = claimData.some(c => parseInt(c.claim_count) > 0);
+
+  // Live on-chain claim detection (matches FARGRAM). Prefer it over the cron cache so
+  // claims show accurately in real time; fall back to cache only if live finds none.
+  const live = await computeClaimsLive(tokens);
+  const totalClaimedEth = live.count > 0 ? live.weth : cachedClaimedEth;
+  const claimCount = live.count > 0 ? live.count : cachedClaimCount;
+  const hasClaimed = live.count > 0 || cachedClaimCount > 0;
+  const lastClaimedAt = live.lastTs ? new Date(live.lastTs).toISOString() : null;
 
   return {
     found: true,
@@ -306,7 +361,7 @@ async function lookupProfile({ username, wallet }) {
       launched_at: t.launched_at,
     })),
     tokens: tokens.slice(0, 10).map(t => ({ token_address: t.token_address, token_name: t.token_name, token_symbol: t.token_symbol, deployer_wallet: t.deployer_wallet, fee_recipient_wallet: t.fee_recipient_wallet, x_username: t.x_username, x_username_fee: t.x_username_fee, unclaimed_token: t.unclaimed_token, unclaimed_weth: t.unclaimed_weth, unclaimed_usd: t.unclaimed_usd, token_symbol_fees: t.token_symbol_fees, fee_share: t.fee_share, fee_claimable_weth: t.fee_claimable_weth, fee_lifetime_weth: t.fee_lifetime_weth, fee_has_claimed: t.fee_has_claimed, fee_claimed_count: t.fee_claimed_count, deployer_is_recipient: (t.deployer_wallet && t.fee_recipient_wallet) ? (t.deployer_wallet.toLowerCase() === t.fee_recipient_wallet.toLowerCase()) : true, launched_at: t.launched_at, is_new: t.is_new })),
-    claims: { has_claimed: hasClaimed, total_eth_claimed: totalClaimedEth.toFixed(4), claim_history: claimData.slice(0, 5) },
+    claims: { has_claimed: hasClaimed, total_eth_claimed: totalClaimedEth.toFixed(4), claim_count: claimCount, last_claimed_at: lastClaimedAt, claim_txs: (live.txs || []).slice(0, 8), claim_history: claimData.slice(0, 5) },
     sells: { has_sold: sells.length > 0, total_tokens_sold: sells.length, items: sells },
     has_holders_on_x: holdersOnX.length > 0,
     holders_on_x_count: holdersOnX.length,
