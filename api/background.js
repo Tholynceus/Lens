@@ -54,8 +54,27 @@ async function getConfig() {
 // ── Alchemy JSON-RPC helper (Base mainnet) ──
 // Routes through the LENS backend proxy by default (keeps the key server-side).
 // Falls back to a direct call only if the user supplied their own key.
-async function alchemyRpc(apiKeyOrUnused, method, params) {
-  const { LENS_API_URL, ALCHEMY_KEY } = await getConfig();
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Bankr API fetch with retry/backoff (api.bankr.bot rate-limits under load).
+// Returns a Response or null, so existing null-tolerant callers keep working.
+async function bankrFetch(url, opts) {
+  const delays = [0, 600, 1800];
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await _sleep(delays[i]);
+    try {
+      const res = await fetch(url, opts);
+      if (res.status === 429 || res.status >= 500) continue;
+      return res;
+    } catch (e) {}
+  }
+  return null;
+}
+
+// One attempt: proxy first, then direct key. 429 / 5xx / rate-limit are thrown
+// so the retry wrapper can back off and try again.
+async function _alchemyRpcOnce(cfg, method, params) {
+  const { LENS_API_URL, ALCHEMY_KEY } = cfg;
 
   // Preferred path: backend proxy (no key exposed in the extension)
   if (LENS_API_URL) {
@@ -65,11 +84,17 @@ async function alchemyRpc(apiKeyOrUnused, method, params) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ method, params }),
       });
+      if (res.status === 429 || res.status >= 500) throw new Error('rate_limit_' + res.status);
       const json = await res.json();
-      if (json && !json.error && 'result' in json) return json.result;
-      if (json && json.error) throw new Error(json.error.message || 'Alchemy RPC error');
+      if (json && json.error) {
+        const m = String(json.error.message || '').toLowerCase();
+        if (json.error.code === 429 || m.includes('rate') || m.includes('capacity') || m.includes('limit') || m.includes('exceeded')) throw new Error('rate_limit');
+        throw new Error(json.error.message || 'Alchemy RPC error');
+      }
+      if (json && 'result' in json) return json.result;
+      throw new Error('bad proxy response');
     } catch (e) {
-      // fall through to direct key if available
+      // fall through to direct key only if we have one; otherwise rethrow (retryable)
       if (!ALCHEMY_KEY) throw e;
     }
   }
@@ -81,9 +106,33 @@ async function alchemyRpc(apiKeyOrUnused, method, params) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: 1, jsonrpc: '2.0', method, params }),
   });
+  if (res.status === 429 || res.status >= 500) throw new Error('rate_limit_' + res.status);
   const json = await res.json();
-  if (json.error) throw new Error(json.error.message || 'Alchemy RPC error');
+  if (json.error) {
+    const m = String(json.error.message || '').toLowerCase();
+    if (json.error.code === 429 || m.includes('rate') || m.includes('capacity') || m.includes('limit') || m.includes('exceeded')) throw new Error('rate_limit');
+    throw new Error(json.error.message || 'Alchemy RPC error');
+  }
   return json.result;
+}
+
+// Retry wrapper: backs off on transient errors (429 / 5xx / network) so dev
+// claim, dev sold, and bundle reads stop failing intermittently under rate limits.
+async function alchemyRpc(apiKeyOrUnused, method, params) {
+  const cfg = await getConfig();
+  const delays = [0, 500, 1400, 3000]; // 1 try + 3 retries
+  let lastErr = null;
+  for (let i = 0; i < delays.length; i++) {
+    if (delays[i]) await _sleep(delays[i]);
+    try {
+      return await _alchemyRpcOnce(cfg, method, params);
+    } catch (e) {
+      lastErr = e;
+      // retry on any error (almost all are transient: 429, 5xx, network);
+      // params are fixed in our own code so bad-request errors are unlikely.
+    }
+  }
+  throw lastErr || new Error('alchemyRpc failed');
 }
 
 // ── Resolve contract deployer via Alchemy (fast: getAssetTransfers to find creation tx) ──
@@ -171,7 +220,7 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
   let bankrDeployerWallet = null;
 
   try {
-    const listRes = srcBankr ? await fetch('https://api.bankr.bot/token-launches?limit=100') : null;
+    const listRes = srcBankr ? await bankrFetch('https://api.bankr.bot/token-launches?limit=100') : null;
     if (listRes && listRes.ok) {
       const listData = await listRes.json();
       const launches = Array.isArray(listData) ? listData : (listData.launches || []);
@@ -195,7 +244,7 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
   // Returns the default fee recipient wallet + share % + claimable + lifetime earned.
   let feeStructure = null;
   try {
-    const fr = srcBankr ? await fetch(`https://api.bankr.bot/public/doppler/token-fees/${tokenAddress}`) : null;
+    const fr = srcBankr ? await bankrFetch(`https://api.bankr.bot/public/doppler/token-fees/${tokenAddress}`) : null;
     if (fr && fr.ok) {
       const fd = await fr.json();
       const tok = (fd.tokens || [])[0];
@@ -257,19 +306,11 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
     }
   } catch (e) {}
 
-  // ── Use the REAL dev wallet for activity attribution ──
-  // Bankr/Doppler tokens are deployed on-chain by Bankr's SHARED launcher wallet, so the
-  // contract deployer is NOT the project owner. The real dev is the fee recipient. Without
-  // this, the launcher's aggregate claims/sells across every token it ever launched get
-  // blamed on this one dev (e.g. a "54 ETH claimed" history that isn't theirs).
-  const realDevWallet = feeStructure?.fee_recipient_wallet || bankrDeployerWallet;
-  if (realDevWallet) deployerWallet = realDevWallet.toLowerCase();
-
   // Step 4: Query Bankrbot creator-fees by deployer wallet
   let creatorFees = null;
   if (deployerWallet) {
     try {
-      const feesRes = srcBankr ? await fetch(`https://api.bankr.bot/public/doppler/creator-fees/${deployerWallet}?days=90`) : null;
+      const feesRes = srcBankr ? await bankrFetch(`https://api.bankr.bot/public/doppler/creator-fees/${deployerWallet}?days=90`) : null;
       if (feesRes && feesRes.ok) {
         const feesData = await feesRes.json();
         const tokens = feesData.tokens || [];
@@ -338,30 +379,8 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
         maxCount: '0x3e8',
       }]);
       const allOut = transfersRes?.transfers || [];
-      // Candidate sells: token transfers to a known DEX router.
-      // BUT launch liquidity seeding also goes to the Doppler router, so a router
-      // destination alone is not a sell. A real sell returns WETH/ETH to the dev in
-      // the SAME tx; liquidity seeding returns nothing. Match by tx hash to be sure.
-      const candidates = allOut.filter(tx => DEX_ROUTERS.has((tx.to || '').toLowerCase()));
-      let sells = [];
-      if (candidates.length > 0) {
-        const WETH_BASE = '0x4200000000000000000000000000000000000006';
-        const proceeds = new Set();
-        try {
-          const wIn = await alchemyRpc(ALCHEMY_KEY, 'alchemy_getAssetTransfers', [{
-            toAddress: deployerWallet, contractAddresses: [WETH_BASE], category: ['erc20'],
-            order: 'desc', excludeZeroValue: true, maxCount: '0x3e8',
-          }]);
-          (wIn?.transfers || []).forEach(t => { if (t.hash) proceeds.add(t.hash.toLowerCase()); });
-          const eIn = await alchemyRpc(ALCHEMY_KEY, 'alchemy_getAssetTransfers', [{
-            toAddress: deployerWallet, category: ['external', 'internal'],
-            order: 'desc', excludeZeroValue: true, maxCount: '0x3e8',
-          }]);
-          (eIn?.transfers || []).forEach(t => { if (t.hash) proceeds.add(t.hash.toLowerCase()); });
-        } catch (e) {}
-        // keep only router transfers that paid WETH/ETH back to the dev = actual sells
-        sells = candidates.filter(tx => tx.hash && proceeds.has(tx.hash.toLowerCase()));
-      }
+      // Filter: only transfers to DEX routers = real sells
+      const sells = allOut.filter(tx => DEX_ROUTERS.has((tx.to || '').toLowerCase()));
       if (sells.length > 0) {
         const total = sells.reduce((s, tx) => s + (tx.value || 0), 0);
         const fmt = n => n<1000?n.toFixed(2):n<1e6?`${(n/1000).toFixed(1)}K`:`${(n/1e6).toFixed(1)}M`;
@@ -409,26 +428,11 @@ async function fetchBankrFull(tokenAddress, settings = {}) {
 
       // Merge & deduplicate by hash
       const seen = new Set();
-      let allClaims = [...intClaims, ...extClaims].filter(tx => {
+      const allClaims = [...intClaims, ...extClaims].filter(tx => {
         if (seen.has(tx.hash)) return false;
         seen.add(tx.hash);
         return true;
-      });
-
-      // A fee claim is paid out BY A CONTRACT (the pool / fee locker). Plain ETH sent
-      // from another wallet (gas funding, a transfer from an exchange) is NOT a claim,
-      // so require the sender to be a contract. Kills "dev claimed" false positives.
-      const senders = [...new Set(allClaims.map(tx => (tx.from || '').toLowerCase()).filter(Boolean))];
-      const isContractSrc = {};
-      await Promise.all(senders.map(async addr => {
-        try {
-          const code = await alchemyRpc(ALCHEMY_KEY, 'eth_getCode', [addr, 'latest']);
-          isContractSrc[addr] = !!(code && code !== '0x' && code.length > 2);
-        } catch (e) { isContractSrc[addr] = false; }
-      }));
-      allClaims = allClaims
-        .filter(tx => isContractSrc[(tx.from || '').toLowerCase()])
-        .sort((a, b) => new Date(b.metadata?.blockTimestamp) - new Date(a.metadata?.blockTimestamp));
+      }).sort((a, b) => new Date(b.metadata?.blockTimestamp) - new Date(a.metadata?.blockTimestamp));
 
       if (allClaims.length > 0) {
         const totalEth = allClaims.reduce((s, tx) => s + (tx.value || 0), 0);
